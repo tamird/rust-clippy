@@ -1,10 +1,11 @@
 use std::collections::hash_map::Entry;
 
+use crate::utils::format_args_collector::{argument_value_token, source_tokens};
 use arrayvec::ArrayVec;
 use clippy_config::Conf;
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::macros::{
-    FormatArgsStorage, FormatParamUsage, MacroCall, find_format_arg_expr, format_arg_removal_span,
+    FormatArgsStorage, FormatParamUsage, MacroCall, StoredFormatArgs, find_format_arg_expr, format_arg_removal_span,
     format_placeholder_format_span, is_assert_macro, is_format_macro, is_panic, matching_root_macro_call,
     root_macro_call_first_node,
 };
@@ -25,13 +26,15 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::Applicability;
 use rustc_errors::SuggestionStyle::{CompletelyHidden, ShowCode};
 use rustc_hir::{Expr, ExprKind};
+use rustc_lexer::TokenKind;
 use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, DerefAdjustKind};
 use rustc_middle::ty::{self, GenericArg, List, TraitRef, Ty, TyCtxt, Unnormalized, Upcast as _};
 use rustc_span::edition::Edition::Edition2021;
-use rustc_span::{BytePos, Pos as _, Span, Symbol};
+use rustc_span::{BytePos, Pos as _, Span, Symbol, kw};
 use rustc_trait_selection::infer::TyCtxtInferExt as _;
 use rustc_trait_selection::traits::{Obligation, ObligationCause, Selection, SelectionContext};
+use unicode_normalization::UnicodeNormalization as _;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -341,8 +344,9 @@ impl<'tcx> LateLintPass<'tcx> for FormatArgs<'tcx> {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
         if let Some(macro_call) = root_macro_call_first_node(cx, expr)
             && is_format_macro(cx, macro_call.def_id)
-            && let Some(mut format_args) = self.format_args.get(cx, expr, macro_call.expn)
+            && let Some(stored) = self.format_args.get_with_recovered(cx, expr, macro_call.expn)
         {
+            let mut format_args = stored.args();
             let mut linter = FormatArgsExpr {
                 cx,
                 expr,
@@ -355,8 +359,10 @@ impl<'tcx> LateLintPass<'tcx> for FormatArgs<'tcx> {
                 has_pointer_format: &mut self.has_pointer_format,
             };
 
-            linter.check_trailing_comma();
-            linter.check_templates();
+            if matches!(stored, StoredFormatArgs::Direct(_)) {
+                linter.check_trailing_comma();
+                linter.check_templates();
+            }
 
             if !self.msrv.meets(cx, msrvs::FORMAT_ARGS_CAPTURE) {
                 return;
@@ -370,7 +376,7 @@ impl<'tcx> LateLintPass<'tcx> for FormatArgs<'tcx> {
 
                 uninlined_queue.extend(self.format_args.get_nested(format_args));
                 if let Some(inner_format_args) = uninlined_queue.pop() {
-                    format_args = inner_format_args;
+                    format_args = inner_format_args.args();
 
                     linter = FormatArgsExpr {
                         cx,
@@ -660,18 +666,18 @@ impl<'tcx> FormatArgsExpr<'_, 'tcx> {
     fn check_one_arg(&self, pos: &FormatArgPosition, usage: FormatParamUsage, fixes: &mut Vec<(Span, String)>) -> bool {
         let index = pos.index.unwrap();
         let arg = &self.format_args.arguments.all_args()[index];
+        let captured =
+            matches!(arg.kind, FormatArgumentKind::Captured(_)) || self.format_args.span.contains(arg.original_span);
 
-        if !matches!(arg.kind, FormatArgumentKind::Captured(_))
-            && let rustc_ast::ExprKind::Path(None, path) = &arg.expr.kind
-            && let [segment] = path.segments.as_slice()
-            && segment.args.is_none()
+        if !captured
+            && let Some(name) = self.format_arg_name(arg)
             && let Some(arg_span) = format_arg_removal_span(self.format_args, index)
             && let Some(pos_span) = pos.span
         {
             let replacement = match usage {
-                FormatParamUsage::Argument => segment.ident.name.to_string(),
-                FormatParamUsage::Width => format!("{}$", segment.ident.name),
-                FormatParamUsage::Precision => format!(".{}$", segment.ident.name),
+                FormatParamUsage::Argument => name,
+                FormatParamUsage::Width => format!("{name}$"),
+                FormatParamUsage::Precision => format!(".{name}$"),
             };
             fixes.push((pos_span, replacement));
             fixes.push((arg_span, String::new()));
@@ -680,9 +686,37 @@ impl<'tcx> FormatArgsExpr<'_, 'tcx> {
             // Do not continue inlining (return false) in case
             // * if we can't inline a numbered argument, e.g. `print!("{0} ...", foo.bar, ...)`
             // * if allow_mixed_uninlined_format_args is false and this arg hasn't been inlined already
-            pos.kind != FormatArgPositionKind::Number
-                && (!self.ignore_mixed || matches!(arg.kind, FormatArgumentKind::Captured(_)))
+            pos.kind != FormatArgPositionKind::Number && (!self.ignore_mixed || captured)
         }
+    }
+
+    fn format_arg_name(&self, arg: &rustc_ast::FormatArgument) -> Option<String> {
+        let source = arg.original_span.get_text(self.cx)?;
+        let path_ident = if let rustc_ast::ExprKind::Path(None, path) = &arg.expr.kind {
+            path.as_single_argless_ident()
+        } else {
+            None
+        };
+        if let Some(ident) = path_ident
+            && source.strip_prefix("r#").unwrap_or(&source) == ident.name.as_str()
+        {
+            return Some(ident.name.to_string());
+        }
+
+        let mut tokens = source_tokens(&source).peekable();
+        let (_, offset, TokenKind::Ident | TokenKind::RawIdent) = argument_value_token(&mut tokens)? else {
+            return None;
+        };
+        let name = &source[offset..];
+        let name = name.strip_prefix("r#").unwrap_or(name);
+        if tokens.next().is_some() || !rustc_lexer::is_ident(name) {
+            return None;
+        }
+        let symbol = Symbol::intern(name);
+        (matches!(symbol, kw::SelfLower | kw::SelfUpper)
+            || !symbol.is_reserved(|| arg.original_span.edition())
+            || path_ident.is_some_and(|ident| ident.name == symbol))
+        .then(|| name.nfc().collect())
     }
 
     fn check_format_in_format_args(&self, name: Symbol, arg: &Expr<'_>) {

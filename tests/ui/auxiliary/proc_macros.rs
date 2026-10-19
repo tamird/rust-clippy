@@ -8,6 +8,8 @@ use proc_macro::Delimiter::{self, Brace, Parenthesis};
 use proc_macro::Spacing::{self, Alone, Joint};
 use proc_macro::token_stream::IntoIter;
 use proc_macro::{Group, Ident, Literal, Punct, Span, TokenStream, TokenTree as TT};
+use syn::ext::IdentExt as _;
+use syn::parse::Parser as _;
 use syn::spanned::Spanned;
 
 type Result<T> = core::result::Result<T, TokenStream>;
@@ -138,6 +140,61 @@ pub fn make_it_big(input: TokenStream) -> TokenStream {
         expr_lit.lit = syn::parse_quote_spanned!( len_span => #new_val);
     }
     quote::quote!(#expr_repeat).into()
+}
+
+#[clippy::format_args]
+#[proc_macro]
+pub fn adapted_format_args(input: TokenStream) -> TokenStream {
+    adapt_format_args(input, false)
+}
+
+#[clippy::format_args]
+#[proc_macro]
+pub fn adapted_format_args_arg_span(input: TokenStream) -> TokenStream {
+    adapt_format_args(input, true)
+}
+
+fn adapt_format_args(input: TokenStream, argument_span: bool) -> TokenStream {
+    let parser = |input: syn::parse::ParseStream<'_>| {
+        let format: syn::LitStr = input.parse()?;
+        if !input.is_empty() {
+            input.parse::<syn::Token![,]>()?;
+        }
+        let args = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated(input)?;
+        Ok((format, args))
+    };
+    let (format, args) = syn::parse_macro_input!(input with parser);
+    let span = format.span();
+    let explicit = args.iter().map(|arg| {
+        let span = if argument_span {
+            match arg {
+                syn::Expr::Assign(assign) => assign.right.span(),
+                _ => quote::quote!(#arg).into_iter().next().unwrap().span(),
+            }
+        } else {
+            span
+        };
+        if let syn::Expr::Assign(assign) = arg {
+            let name = &assign.left;
+            let value = &assign.right;
+            return quote::quote_spanned!(span => #name = Adapter(&(#value)));
+        }
+        quote::quote_spanned!(span => Adapter(&(#arg)))
+    });
+    let text = format.value();
+    let captured = text.split('{').skip(1).filter_map(|part| {
+        let (name, _) = part.split_once('}')?;
+        let mut ident = syn::Ident::parse_any.parse_str(name).ok()?;
+        if args.iter().any(|arg| {
+            let syn::Expr::Assign(assign) = arg else { return false };
+            matches!(&*assign.left, syn::Expr::Path(path) if path.path.get_ident().is_some_and(|explicit| explicit.unraw() == ident))
+        }) {
+            return None;
+        }
+        ident.set_span(span);
+        Some(quote::quote_spanned!(span => #ident = Adapter(&#ident)))
+    });
+    quote::quote_spanned!(span => ::core::format_args!(#format #(, #explicit)* #(, #captured)*)).into()
 }
 
 /// Within the item this attribute is attached to, an `inline!` macro is available which expands the

@@ -1,0 +1,76 @@
+error: variables can be used directly in the `format!` string
+  --> tests/ui/uninlined_format_args_adapted.rs:29:34
+   |
+LL |     let _ = adapted_format_args!("{} {} {captured}", value, other);
+   |                                  ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `-D clippy::uninlined-format-args` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::uninlined_format_args)]`
+help: change this to
+   |
+LL -     let _ = adapted_format_args!("{} {} {captured}", value, other);
+LL +     let _ = adapted_format_args!("{value} {other} {captured}");
+   |
+
+error: variables can be used directly in the `format!` string
+  --> tests/ui/uninlined_format_args_adapted.rs:31:37
+   |
+LL |     let _ = forwarding_format_args!("{}", value);
+   |                                     ^^^^
+   |
+help: change this to
+   |
+LL -     let _ = forwarding_format_args!("{}", value);
+LL +     let _ = forwarding_format_args!("{value}");
+   |
+
+error: variables can be used directly in the `format!` string
+  --> tests/ui/uninlined_format_args_adapted.rs:34:43
+   |
+LL |     let _ = adapted_format_args_arg_span!("{}", résumé);
+   |                                           ^^^^
+   |
+help: change this to
+   |
+LL -     let _ = adapted_format_args_arg_span!("{}", résumé);
+LL +     let _ = adapted_format_args_arg_span!("{résumé}");
+   |
+
+error: variables can be used directly in the `format!` string
+  --> tests/ui/uninlined_format_args_adapted.rs:36:34
+   |
+LL |     let _ = adapted_format_args!("{alias}", alias = value);
+   |                                  ^^^^^^^^^
+   |
+help: change this to
+   |
+LL -     let _ = adapted_format_args!("{alias}", alias = value);
+LL +     let _ = adapted_format_args!("{value}");
+   |
+
+error: variables can be used directly in the `format!` string
+  --> tests/ui/uninlined_format_args_adapted.rs:46:13
+   |
+LL |     let _ = format_args!("{alias}", alias = r#type);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: change this to
+   |
+LL -     let _ = format_args!("{alias}", alias = r#type);
+LL +     let _ = format_args!("{type}");
+   |
+
+error: variables can be used directly in the `format!` string
+  --> tests/ui/uninlined_format_args_adapted.rs:61:38
+   |
+LL |         let _ = adapted_format_args!("{}", self);
+   |                                      ^^^^
+   |
+help: change this to
+   |
+LL -         let _ = adapted_format_args!("{}", self);
+LL +         let _ = adapted_format_args!("{self}");
+   |
+
+error: aborting due to 6 previous errors
+

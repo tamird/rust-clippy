@@ -432,10 +432,24 @@ fn is_assert_arg(cx: &LateContext<'_>, expr: &Expr<'_>, assert_expn: ExpnId) -> 
     }
 }
 
+#[derive(Debug)]
+pub enum StoredFormatArgs {
+    Direct(FormatArgs),
+    Recovered(FormatArgs),
+}
+
+impl StoredFormatArgs {
+    pub fn args(&self) -> &FormatArgs {
+        match self {
+            Self::Direct(args) | Self::Recovered(args) => args,
+        }
+    }
+}
+
 /// Stores AST [`FormatArgs`] nodes for use in late lint passes, as they are in a desugared form in
 /// the HIR
 #[derive(Default, Clone)]
-pub struct FormatArgsStorage(Arc<OnceLock<FxHashMap<Span, FormatArgs>>>);
+pub struct FormatArgsStorage(Arc<OnceLock<FxHashMap<Span, StoredFormatArgs>>>);
 
 impl FormatArgsStorage {
     /// Returns an AST [`FormatArgs`] node if a `format_args` expansion is found as a descendant of
@@ -443,6 +457,18 @@ impl FormatArgsStorage {
     ///
     /// See also [`find_format_arg_expr`]
     pub fn get(&self, cx: &LateContext<'_>, start: &Expr<'_>, expn_id: ExpnId) -> Option<&FormatArgs> {
+        match self.get_with_recovered(cx, start, expn_id)? {
+            StoredFormatArgs::Direct(args) => Some(args),
+            StoredFormatArgs::Recovered(_) => None,
+        }
+    }
+
+    pub fn get_with_recovered(
+        &self,
+        cx: &LateContext<'_>,
+        start: &Expr<'_>,
+        expn_id: ExpnId,
+    ) -> Option<&StoredFormatArgs> {
         let format_args_expr = for_each_expr_without_closures(start, |expr| {
             let ctxt = expr.span.ctxt();
             if ctxt.outer_expn().is_descendant_of(expn_id) {
@@ -464,8 +490,8 @@ impl FormatArgsStorage {
         self.0.get()?.get(&format_args_expr.span.with_parent(None))
     }
 
-    /// Returns AST [`FormatArgs`] nodes if there are any nested inside `parent_format_args`.
-    pub fn get_nested(&self, parent_format_args: &FormatArgs) -> Vec<&FormatArgs> {
+    /// Returns [`StoredFormatArgs`] nodes if there are any nested inside `parent_format_args`.
+    pub fn get_nested(&self, parent_format_args: &FormatArgs) -> Vec<&StoredFormatArgs> {
         let mut nested = Vec::new();
         let Some(format_args_map) = self.0.get() else {
             return nested;
@@ -483,7 +509,7 @@ impl FormatArgsStorage {
     }
 
     /// Should only be called by `FormatArgsCollector`
-    pub fn set(&self, format_args: FxHashMap<Span, FormatArgs>) {
+    pub fn set(&self, format_args: FxHashMap<Span, StoredFormatArgs>) {
         self.0
             .set(format_args)
             .expect("`FormatArgsStorage::set` should only be called once");
@@ -553,17 +579,19 @@ pub fn format_args_inputs_span(format_args: &FormatArgs) -> Span {
 /// //            ^^^^
 /// ```
 pub fn format_arg_removal_span(format_args: &FormatArgs, index: usize) -> Option<Span> {
-    let ctxt = format_args.span.ctxt();
-
-    let current = hygiene::walk_chain(format_args.arguments.by_index(index)?.expr.span, ctxt);
-
-    let prev = if index == 0 {
-        format_args.span
-    } else {
-        hygiene::walk_chain(format_args.arguments.by_index(index - 1)?.expr.span, ctxt)
-    };
-
+    let current = format_arg_source_span(format_args, format_args.arguments.by_index(index)?)?;
+    let prev = format_args.arguments.explicit_args()[..index]
+        .iter()
+        .rev()
+        .find_map(|arg| format_arg_source_span(format_args, arg))
+        .unwrap_or_else(|| hygiene::walk_chain(format_args.span, current.ctxt()));
     Some(current.with_lo(prev.hi()))
+}
+
+fn format_arg_source_span(format_args: &FormatArgs, arg: &FormatArgument) -> Option<Span> {
+    let span = arg.original_span;
+    let format_span = hygiene::walk_chain(format_args.span, span.ctxt());
+    (format_span.ctxt() == span.ctxt() && span.lo() >= format_span.hi()).then_some(span)
 }
 
 /// Where a format parameter is being used in the format string

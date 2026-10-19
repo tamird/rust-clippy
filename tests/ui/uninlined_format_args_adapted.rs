@@ -1,0 +1,72 @@
+//@aux-build:proc_macros.rs
+
+#![warn(clippy::uninlined_format_args)]
+
+use proc_macros::{adapted_format_args, adapted_format_args_arg_span};
+use std::fmt;
+
+struct Value;
+struct Adapter<'a, T>(&'a T);
+
+impl<T> fmt::Display for Adapter<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self.0;
+        f.write_str("adapted")
+    }
+}
+
+#[clippy::format_args]
+macro_rules! forwarding_format_args {
+    ($($args:tt)*) => {
+        adapted_format_args!($($args)*)
+    };
+}
+
+fn main() {
+    let value = Value;
+    let other = Value;
+    let captured = Value;
+    let _ = adapted_format_args!("{} {} {captured}", value, other);
+    //~^ uninlined_format_args
+    let _ = forwarding_format_args!("{}", value);
+    //~^ uninlined_format_args
+    let résumé = Value;
+    let _ = adapted_format_args_arg_span!("{}", résumé);
+    //~^ uninlined_format_args
+    let _ = adapted_format_args!("{alias}", alias = value);
+    //~^ uninlined_format_args
+    let _ = adapted_format_args!("{}", { Value });
+    let _ = adapted_format_args!("{}", true);
+    let number = 1;
+    let _ = adapted_format_args_arg_span!("{}", number + 1);
+    let r#type = Value;
+    let _ = adapted_format_args!("{}", r#type);
+    let _ = adapted_format_args_arg_span!("{}", r#type);
+    let r#type = 1;
+    let _ = format_args!("{alias}", alias = r#type);
+    //~^ uninlined_format_args
+}
+
+#[allow(clippy::uninlined_format_args)]
+fn explicit_write(value: Value) {
+    use std::io::Write as _;
+    std::io::stdout().write_fmt(adapted_format_args!("{}", value)).unwrap();
+    std::io::stdout()
+        .write_fmt(adapted_format_args_arg_span!("{alias}", r#alias = value))
+        .unwrap();
+}
+
+impl Value {
+    fn method(&self) {
+        let _ = adapted_format_args!("{}", self);
+        //~^ uninlined_format_args
+    }
+}
+
+#[warn(clippy::pointer_format)]
+fn pointer_format() {
+    #[derive(Debug)]
+    struct Adapter<'a, T>(&'a T);
+
+    let _ = adapted_format_args!("{:?} {:?}", std::ptr::null::<u8>(), 0u8);
+}
